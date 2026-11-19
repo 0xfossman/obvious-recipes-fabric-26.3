@@ -1,0 +1,7 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": ["  g", "gsg", "ggg"],
+  "key": {"g": "minecraft:gold_ingot", "s": "minecraft:saddle"},
+  "result": {"id": "minecraft:golden_horse_armor"}
+}
