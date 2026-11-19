@@ -1,0 +1,153 @@
+import groovy.json.JsonSlurper
+
+plugins {
+    id 'java'
+    id 'maven-publish'
+    id 'com.diffplug.spotless' version '8.11.0'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly "net.fabricmc:fabric-loader:${project.loader_version}"
+    compileOnly 'org.slf4j:slf4j-api:2.0.17'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    inputs.property 'minecraft_version', project.minecraft_version
+
+    filesMatching('fabric.mod.json') {
+        expand version: project.version, minecraft_version: project.minecraft_version
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+}
+
+spotless {
+    java {
+        googleJavaFormat('2.0.0')
+        target 'src/**/*.java'
+    }
+    format 'misc', {
+        target '*.gradle', '*.md', '.gitignore', 'gradle.properties', 'settings.gradle', 'src/**/*.json'
+        trimTrailingWhitespace()
+        leadingTabsToSpaces(4)
+        endWithNewline()
+    }
+}
+
+tasks.register('validateRecipes') {
+    def recipeDirectory = file('src/main/resources/data/obviousrecipes/recipe')
+    inputs.dir(recipeDirectory)
+
+    doLast {
+        def recipes = fileTree(recipeDirectory).matching { include '**/*.json' }.files
+        if (recipes.empty) {
+            throw new GradleException('No recipes found')
+        }
+
+        def parsedRecipes = recipes.collectEntries { recipeFile ->
+            def recipe = new JsonSlurper().parse(recipeFile)
+            [(recipeFile.name): recipe]
+        }
+        def groupedResults = parsedRecipes.values().groupBy { recipe ->
+            "${recipe.type}:${recipe.result?.id}"
+        }
+
+        recipes.each { recipeFile ->
+            def recipe = parsedRecipes[recipeFile.name]
+            def fail = { String message ->
+                throw new GradleException("${recipeFile}: ${message}")
+            }
+            def checkItemId = { Object value ->
+                if (!(value instanceof String)) {
+                    fail('ingredients must use Minecraft 26.3 string identifiers')
+                }
+                def id = value.startsWith('#') ? value.substring(1) : value
+                if (!id.matches('[a-z0-9_.-]+:[a-z0-9_./-]+')) {
+                    fail("invalid ingredient identifier: ${value}")
+                }
+            }
+
+            if (!(recipe.type in ['minecraft:crafting_shaped', 'minecraft:crafting_shapeless', 'minecraft:smelting'])) {
+                fail('unsupported or missing recipe type')
+            }
+            if (!(recipe.result?.id instanceof String)) {
+                fail('result must have a namespaced id')
+            }
+
+            if (recipe.type == 'minecraft:crafting_shaped') {
+                if (!(recipe.pattern instanceof List) || recipe.pattern.empty || recipe.pattern.size() > 3 ||
+                    !recipe.pattern.every { it instanceof String } ||
+                    recipe.pattern.any { it.length() != recipe.pattern.first().length() || it.length() > 3 } ||
+                    !(recipe.key instanceof Map)) {
+                    fail('invalid shaped recipe pattern or key')
+                }
+                def usedKeys = recipe.pattern.join('').toSet() - [' ' as char] as Set
+                if (usedKeys != recipe.key.keySet()) {
+                    fail('pattern symbols do not match ingredient keys')
+                }
+                recipe.key.values().each(checkItemId)
+            } else if (recipe.type == 'minecraft:crafting_shapeless') {
+                if (!(recipe.ingredients instanceof List) || recipe.ingredients.empty) {
+                    fail('shapeless recipe needs ingredients')
+                }
+                recipe.ingredients.each(checkItemId)
+            } else {
+                checkItemId(recipe.ingredient)
+                if (!(recipe.experience instanceof Number) || !(recipe.cookingtime instanceof Number)) {
+                    fail('smelting recipe needs experience and cookingtime')
+                }
+            }
+        }
+
+        groupedResults.findAll { key, values -> values.size() > 1 }.each { key, values ->
+            def groups = values.collect { it.group }.toSet()
+            if (groups.size() != 1 || groups.first() == null || groups.first().toString().isBlank()) {
+                throw new GradleException("Recipes producing ${key} must share a non-empty group")
+            }
+        }
+
+        def pack = new JsonSlurper().parse(file('src/main/resources/pack.mcmeta')).pack
+        if (pack.min_format != [121, 0] || pack.max_format != [121, 0]) {
+            throw new GradleException('pack.mcmeta must target Minecraft 26.3 data-pack format 121.0')
+        }
+
+        logger.lifecycle("Validated ${recipes.size()} Minecraft 26.3 recipes")
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('spotlessCheck'), tasks.named('validateRecipes')
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+        }
+    }
+}
